@@ -272,11 +272,22 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 - [ ] **Step 8: Поднять сервисы и прогнать тест**
 
+Окружение создаётся через `uv` — он уже стоит на машине и сам поставит нужную
+версию Python. Системный интерпретатор не трогаем: 3.14 слишком свежий, часть
+пакетов ещё без готовых сборок под него.
+
 ```bash
 cp .env.example .env      # заполнить пароли
 docker compose --profile dev up -d
-cd sync && pip install -e ".[dev]" && pytest tests/test_smoke.py -v
+
+cd sync
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+uv run pytest tests/test_smoke.py -v
 ```
+
+Дальше во всех задачах вместо `pytest ...` запускать `uv run pytest ...`
+из каталога `sync`.
 
 Expected: три теста PASS.
 
