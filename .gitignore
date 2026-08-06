@@ -1,0 +1,31 @@
+# мокапы и служебные файлы визуального компаньона
+.superpowers/
+
+# секреты — реальные пароли к БД никогда не попадают в репозиторий
+.env
+.env.local
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# node
+node_modules/
+dist/
+build/
+
+# данные — из рабочего контура ничего не выносится
+*.csv
+*.tsv
+*.dump
+*.sql.gz
+data/
+
+# среда
+.DS_Store
+.idea/
+.vscode/
