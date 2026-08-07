@@ -940,10 +940,12 @@ git commit -m "Настройки и соединения; источник от
 ```python
 """Кусок — минимальная единица заливки. От него зависит подмена партиций,
 поэтому границы и идентификаторы проверяем придирчиво."""
+import dataclasses
 from datetime import date
 
 import pytest
-from gfd_sync.chunks import Chunk, chunk_of, chunk_from_key, chunks_in_period
+
+from gfd_sync.chunks import Chunk, chunk_from_key, chunk_of, chunks_in_period
 
 
 def test_идентификатор_партиции():
@@ -986,8 +988,24 @@ def test_период_с_середины_месяца_берёт_месяц_ц�
     assert got == [Chunk(2026, 5, "ЛЕНТА"), Chunk(2026, 6, "ЛЕНТА")]
 
 
+def test_вырожденный_период_не_даёт_кусков():
+    """Пустой полуинтервал — ничего не заливаем. Иначе повторный запуск
+    без новых данных подменил бы партицию впустую."""
+    assert chunks_in_period(date(2026, 8, 1), date(2026, 8, 1), ["ЛЕНТА"]) == []
+    assert chunks_in_period(date(2026, 9, 1), date(2026, 8, 1), ["ЛЕНТА"]) == []
+
+
+def test_кривой_месяц_отвергается_сразу():
+    """Кусок с месяцем 13 создался бы молча и всплыл бы уже именем партиции
+    или пустой выборкой — то есть далеко от места ошибки."""
+    with pytest.raises(ValueError):
+        Chunk(2026, 13, "ЛЕНТА")
+    with pytest.raises(ValueError):
+        chunk_from_key("202600/ЛЕНТА")
+
+
 def test_кусок_неизменяем():
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         Chunk(2026, 7, "ЛЕНТА").month = 8
 ```
 
@@ -1015,6 +1033,12 @@ class Chunk:
     year: int
     month: int
     chain: str
+
+    def __post_init__(self) -> None:
+        # Кусок с месяцем 13 дожил бы до имени партиции или до пустой выборки
+        # и всплыл бы далеко от места, где его собрали.
+        if not 1 <= self.month <= 12:
+            raise ValueError(f"месяц вне 1..12: {self.month}")
 
     @property
     def partition_id(self) -> tuple[int, str]:
@@ -1060,7 +1084,7 @@ def chunks_in_period(date_from: date, date_to: date,
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_chunks.py -v`
-Expected: восемь тестов PASS.
+Expected: десять тестов PASS.
 
 - [ ] **Step 5: Коммит**
 
