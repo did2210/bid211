@@ -2065,16 +2065,18 @@ git commit -m "Заливка куска через промежуточную �
 ```python
 """Сверка ловит любые изменения в источнике, как бы они ни произошли."""
 import os
-from decimal import Decimal
+from contextlib import contextmanager
+from datetime import date
 
 import psycopg
 import pytest
+
 from gfd_sync.chunks import Chunk
 from gfd_sync.clients import ch_client
 from gfd_sync.loader import load_chunk, target_stats
 from gfd_sync.reader import source_stats
-from gfd_sync.schema import create_sales_tables, create_dictionaries
-from gfd_sync.verifier import verify_chunks, repair
+from gfd_sync.schema import create_dictionaries, create_sales_tables
+from gfd_sync.verifier import known_chains, recent_period, repair, verify_chunks
 
 
 @pytest.fixture(autouse=True)
@@ -2082,6 +2084,30 @@ def подготовка():
     ch = ch_client()
     create_sales_tables(ch)
     create_dictionaries(ch)
+
+
+@contextmanager
+def правка_в_источнике(chunk, надбавка=1000):
+    """Меняет одну строку и возвращает всё назад.
+
+    Синтетика — общий ресурс всех тестов: оставленная правка всплыла бы
+    в чужом тесте расхождением, которого там быть не должно.
+    """
+    with psycopg.connect(os.environ["PG_SOURCE_DSN"], autocommit=True) as conn:
+        (строка,) = conn.execute("""
+            SELECT id FROM sales
+            WHERE pdate >= %s AND pdate < %s AND upper(trim(client)) = %s
+            ORDER BY id LIMIT 1
+        """, (chunk.date_from, chunk.date_to, chunk.chain)).fetchone()
+        conn.execute(
+            "UPDATE sales SET salesvalue = salesvalue + %s WHERE id = %s",
+            (надбавка, строка))
+        try:
+            yield строка
+        finally:
+            conn.execute(
+                "UPDATE sales SET salesvalue = salesvalue - %s WHERE id = %s",
+                (надбавка, строка))
 
 
 def test_совпадающий_кусок_расхождений_не_даёт():
@@ -2105,24 +2131,54 @@ def test_правка_в_источнике_обнаруживается():
     load_chunk(chunk)
     assert verify_chunks([chunk]) == []
 
-    with psycopg.connect(os.environ["PG_SOURCE_DSN"], autocommit=True) as conn:
-        conn.execute("""
-            UPDATE sales SET salesvalue = salesvalue + 1000
-            WHERE id = (SELECT id FROM sales
-                        WHERE pdate >= '2026-08-01' AND pdate < '2026-09-01'
-                          AND upper(client) = 'ЛЕНТА' LIMIT 1)
-        """)
-    assert len(verify_chunks([chunk])) == 1
+    with правка_в_источнике(chunk):
+        assert len(verify_chunks([chunk])) == 1
+
+    load_chunk(chunk)      # возвращаем витрину к исходной синтетике
 
 
 def test_починка_устраняет_расхождение():
     chunk = Chunk(2026, 8, "ЛЕНТА")
-    mismatches = verify_chunks([chunk])
-    assert mismatches, "к этому моменту расхождение должно быть"
-    results = repair(mismatches)
-    assert all(r.replaced for r in results)
-    assert verify_chunks([chunk]) == []
-    assert target_stats(chunk) == source_stats(chunk)
+    load_chunk(chunk)
+
+    with правка_в_источнике(chunk):
+        mismatches = verify_chunks([chunk])
+        assert mismatches, "правка обязана дать расхождение"
+        results = repair(mismatches)
+        assert all(r.replaced for r in results)
+        assert verify_chunks([chunk]) == []
+        assert target_stats(chunk) == source_stats(chunk)
+
+    load_chunk(chunk)
+
+
+def test_исключённые_сети_не_попадают_в_перечисление():
+    """Попади исключённая сеть в список — сверка нашла бы у неё расхождение
+    (в источнике строки есть, в витрине их не должно быть), и починка
+    заливала бы её снова и снова. Вечный ложный алярм.
+    """
+    сети = known_chains()
+    for сеть in ("ДОМ ЛЕНТА", "КАРУСЕЛЬ", "ЛЕНТА ЗООМАРКЕТ", "ПЯТЁРОЧКА РЦ"):
+        assert сеть not in сети
+    assert "МАГНИТ" in сети, "обычные сети перечисляться обязаны"
+
+
+def test_перечисление_за_период_не_шире_полного():
+    сети_месяца = known_chains(date(2026, 7, 1), date(2026, 8, 1))
+    assert set(сети_месяца) <= set(known_chains())
+    assert сети_месяца, "в июле сети торговали — список пустым быть не может"
+
+
+@pytest.mark.parametrize("сегодня, месяцев, ожидание", [
+    (date(2026, 8, 7), 3, (date(2026, 6, 1), date(2026, 9, 1))),
+    (date(2026, 1, 15), 3, (date(2025, 11, 1), date(2026, 2, 1))),
+    (date(2026, 3, 1), 1, (date(2026, 3, 1), date(2026, 4, 1))),
+    (date(2026, 12, 31), 2, (date(2026, 11, 1), date(2027, 1, 1))),
+])
+def test_свежий_хвост_считается_по_календарю(сегодня, месяцев, ожидание):
+    """Переход через год — место, где такие расчёты ошибаются чаще всего,
+    а промах здесь означает молча несверенный месяц."""
+    assert recent_period(месяцев, today=сегодня) == ожидание
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2157,13 +2213,25 @@ class Mismatch(NamedTuple):
     target: Stats
 
 
-def known_chains() -> list[str]:
-    """Сети, встречающиеся в источнике, кроме исключённых."""
+def known_chains(date_from: date | None = None,
+                 date_to: date | None = None) -> list[str]:
+    """Сети, встречающиеся в источнике, кроме исключённых.
+
+    Период стоит задавать всегда, когда он известен: без него запрос
+    вычитывает таблицу продаж целиком, а с ним планировщик уходит
+    в индекс (upper(trim(client)), pdate) и читает только нужный кусок.
+    """
     excluded = ", ".join(f"'{c}'" for c in EXCLUDED_CHAINS)
+    период = ""
+    параметры: tuple = ()
+    if date_from is not None and date_to is not None:
+        период = "AND pdate >= %s AND pdate < %s"
+        параметры = (date_from, date_to)
     with pg_source() as conn:
         rows = conn.execute(
             f"SELECT DISTINCT upper(trim(client)) FROM public.sales "
-            f"WHERE upper(trim(client)) NOT IN ({excluded})"
+            f"WHERE upper(trim(client)) NOT IN ({excluded}) {период}",
+            параметры,
         ).fetchall()
     return sorted(r[0] for r in rows)
 
@@ -2177,15 +2245,32 @@ def verify_chunks(chunks: list[Chunk]) -> list[Mismatch]:
     return out
 
 
-def verify_recent(months: int = 3) -> list[Mismatch]:
-    """Сверка свежего хвоста — дёшево, гоняется каждые десять минут."""
-    s = get_settings()
-    today = date.today()
+def recent_period(months: int, today: date | None = None) -> tuple[date, date]:
+    """Полуинтервал из последних `months` календарных месяцев, включая текущий.
+
+    Вынесено отдельно, потому что вся тонкость здесь — переход через год,
+    а промах означает молча несверенный месяц.
+    """
+    today = today or date.today()
     year, month = today.year, today.month - months + 1
     while month < 1:
         year, month = year - 1, month + 12
-    date_from = max(date(year, month, 1), s.load_date_from)
-    return verify_chunks(chunks_in_period(date_from, s.load_date_to, known_chains()))
+    конец = (date(today.year + 1, 1, 1) if today.month == 12
+             else date(today.year, today.month + 1, 1))
+    return date(year, month, 1), конец
+
+
+def verify_recent(months: int = 3) -> list[Mismatch]:
+    """Сверка свежего хвоста — дёшево, гоняется каждые десять минут."""
+    s = get_settings()
+    начало, конец = recent_period(months)
+    # За границы заливки не выходим: месяцев вне периода в витрине нет
+    # по определению, и сверять их означало бы искать расхождение там,
+    # где его не может быть.
+    начало = max(начало, s.load_date_from)
+    конец = min(конец, s.load_date_to)
+    return verify_chunks(
+        chunks_in_period(начало, конец, known_chains(начало, конец)))
 
 
 def verify_all() -> list[Mismatch]:
@@ -2202,7 +2287,7 @@ def repair(mismatches: list[Mismatch]) -> list[LoadResult]:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_verifier.py -v`
-Expected: четыре теста PASS.
+Expected: десять тестов PASS.
 
 - [ ] **Step 5: Коммит**
 
