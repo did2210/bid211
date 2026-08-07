@@ -2721,7 +2721,11 @@ git commit -m "Обнаружение изменений по load_log"
 ```python
 """Командный интерфейс — то, чем пользуются расписание и админка."""
 from click.testing import CliRunner
+
+from gfd_sync import cli as cli_module
+from gfd_sync.chunks import Chunk
 from gfd_sync.cli import cli
+from gfd_sync.clients import pg_app
 
 
 def test_init_создаёт_схему():
@@ -2730,10 +2734,32 @@ def test_init_создаёт_схему():
     assert "готово" in r.output.lower()
 
 
+def test_init_создаёт_и_служебную_схему():
+    """На сервере init-скрипты PostgreSQL не отработают: база уже развёрнута.
+    Не создай init таблицу журнала — первая же заливка упала бы на записи
+    в историю, уже перелив данные."""
+    with pg_app() as conn:
+        conn.execute("DROP TABLE IF EXISTS sync_journal")
+    assert CliRunner().invoke(cli, ["init"]).exit_code == 0
+    with pg_app() as conn:
+        есть = conn.execute(
+            "SELECT to_regclass('public.sync_journal') IS NOT NULL").fetchone()[0]
+    assert есть
+
+
 def test_load_принимает_ключ_куска():
     r = CliRunner().invoke(cli, ["load", "--chunk", "202607/МАГНИТ"])
     assert r.exit_code == 0
     assert "202607/МАГНИТ" in r.output
+
+
+def test_кривой_ключ_куска_объясняется_по_человечески():
+    """Опечатка в ключе — обычное дело при ручном запуске. Пользователь
+    должен увидеть, что не так, а не трассировку стека."""
+    r = CliRunner().invoke(cli, ["load", "--chunk", "202613/МАГНИТ"])
+    assert r.exit_code != 0
+    assert "202613/МАГНИТ" in r.output
+    assert "Traceback" not in r.output
 
 
 def test_verify_без_расхождений_возвращает_ноль():
@@ -2743,9 +2769,21 @@ def test_verify_без_расхождений_возвращает_ноль():
     assert "расхождений нет" in r.output.lower()
 
 
-def test_verify_с_флагом_repair_чинит():
-    r = CliRunner().invoke(cli, ["verify", "--months", "1", "--repair"])
+def test_verify_показывает_расхождение_и_чинит_по_флагу():
+    """Полный текст — в `sync/tests/test_cli.py`: кусок заливается, его
+    партиция сносится в обход синхронизатора, verify обязан назвать
+    расхождение, а с --repair устранить его."""
+
+
+def test_sync_заливает_ожидающие_куски(monkeypatch):
+    """Настоящий sync разгребает всё, что пришло за сутки; в тесте
+    ограничиваем список одним куском, иначе прогон занял бы минуты."""
+    chunk = Chunk(2026, 7, "ОКЕЙ")
+    monkeypatch.setattr(cli_module, "pending_chunks", lambda: [chunk])
+    monkeypatch.setattr(cli_module, "verify_recent", lambda months=3: [])
+    r = CliRunner().invoke(cli, ["sync"])
     assert r.exit_code == 0
+    assert chunk.key in r.output
 
 
 def test_full_reload_требует_подтверждения():
@@ -2782,13 +2820,27 @@ from __future__ import annotations
 import click
 
 from . import journal
-from .chunks import chunk_from_key, chunks_in_period
+from .chunks import Chunk, chunk_from_key, chunks_in_period
 from .clients import ch_client
 from .config import get_settings
 from .detector import pending_chunks
 from .loader import create_shadow, load_chunk, swap_shadow
 from .schema import create_dictionaries, create_sales_tables
 from .verifier import known_chains, repair, verify_all, verify_chunks, verify_recent
+
+
+def _кусок(ключ: str) -> Chunk:
+    """Разбирает ключ куска, объясняя ошибку по-человечески.
+
+    Ключ приходит из рук человека или из расписания; опечатка не должна
+    выглядеть как падение программы.
+    """
+    try:
+        return chunk_from_key(ключ)
+    except (ValueError, IndexError) as exc:
+        raise click.BadParameter(
+            f"{ключ}: не похоже на ключ куска (ждём вид 202607/МАГНИТ) — {exc}"
+        ) from exc
 
 
 @click.group()
@@ -2802,14 +2854,17 @@ def init() -> None:
     ch = ch_client()
     create_sales_tables(ch)
     create_dictionaries(ch)
-    click.echo("Готово: таблицы и словари созданы")
+    # Схема служебной базы — тоже часть init: на сервере init-скрипты
+    # PostgreSQL не отработают, база там уже развёрнута.
+    journal.ensure_app_schema()
+    click.echo("Готово: таблицы, словари и журнал созданы")
 
 
 @cli.command()
 @click.option("--chunk", "chunk_key", required=True, help="ключ вида 202607/МАГНИТ")
 def load(chunk_key: str) -> None:
     """Залить один кусок."""
-    result = load_chunk(chunk_from_key(chunk_key))
+    result = load_chunk(_кусок(chunk_key))
     journal.record(result, operation="load")
     if result.error:
         click.echo(f"{chunk_key}: ОШИБКА — {result.error}")
@@ -2842,7 +2897,7 @@ def sync() -> None:
 def verify(chunk_key: str | None, months: int, check_all: bool, do_repair: bool) -> None:
     """Сверить витрину с источником."""
     if chunk_key:
-        mismatches = verify_chunks([chunk_from_key(chunk_key)])
+        mismatches = verify_chunks([_кусок(chunk_key)])
     elif check_all:
         mismatches = verify_all()
     else:
@@ -2880,7 +2935,8 @@ def full_reload(yes: bool) -> None:
     ch.command("TRUNCATE TABLE sales_shadow")
 
     s = get_settings()
-    chunks = chunks_in_period(s.load_date_from, s.load_date_to, known_chains())
+    chunks = chunks_in_period(s.load_date_from, s.load_date_to,
+                              known_chains(s.load_date_from, s.load_date_to))
     failed = []
     with click.progressbar(chunks, label="перезаливка") as bar:
         for chunk in bar:
@@ -2913,7 +2969,7 @@ def status(limit: int) -> None:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_cli.py -v`
-Expected: шесть тестов PASS.
+Expected: девять тестов PASS.
 
 - [ ] **Step 5: Коммит**
 
