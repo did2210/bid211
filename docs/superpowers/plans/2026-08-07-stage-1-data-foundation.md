@@ -2572,9 +2572,30 @@ def test_неизвестный_файл_не_роняет_обработку():
     assert got == []
 
 
+def test_исключённые_сети_не_попадают_в_куски():
+    """Файлы от исключённых сетей приходят наравне с прочими. Пропусти их
+    сюда — и каждый такой файл заводил бы перезаливку куска, которого
+    в витрине быть не должно."""
+    files = [{"file_path": "/mnt/gfd_data/in/КАРУСЕЛЬ_2026_07.xlsx"}]
+    assert chunks_from_files(files) == []
+
+
+def test_файл_с_непонятным_именем_всё_равно_разбирается():
+    """Имя файла сужает поиск, но не заменяет данные. Файл, названный
+    не по шаблону «СЕТЬ_ГГГГ_ММ», обязан находиться по содержимому —
+    иначе его правки тихо не доехали бы до витрины.
+
+    Полный текст — в `sync/tests/test_detector.py`: тест временно меняет
+    name_file у одной строки и возвращает значение назад.
+    """
+
+
 def test_ожидающие_куски_не_повторяются():
+    отметить_файл("МАГНИТ_2026_07.xlsx")
     got = pending_chunks()
+    assert got, "только что отмеченный файл обязан дать хотя бы один кусок"
     assert len(got) == len(set(got))
+    assert Chunk(2026, 7, "МАГНИТ") in got
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2590,15 +2611,33 @@ Expected: FAIL — `ModuleNotFoundError: gfd_sync.detector`
 Файл в load_log — сигнал «здесь что-то поменялось». Какие именно куски
 затронуты, спрашиваем у самой таблицы sales по колонке name_file: имя файла
 может быть каким угодно, а данные не врут.
+
+Имя всё же используется — но только чтобы сузить поиск. Индекса по
+name_file в боевой базе нет и не будет (менять её нельзя), поэтому запрос
+без сужения означает полный скан таблицы продаж каждые десять минут: он
+и сам по себе долгий, и вымывает кеш страниц у PostgreSQL, которому мы
+обещали не мешать. Разобрав «СЕТЬ_ГГГГ_ММ.xlsx», мы попадаем в индекс
+(upper(trim(client)), pdate) и читаем только нужный кусок.
+
+Если имя соврало и данные лежат в другом месяце, кусок всё равно будет
+найден — сверкой (verify_recent каждые десять минут, verify_all ночью).
+Детектор здесь быстрый путь, а гарантию даёт сверка.
+
+Полный текст модуля — в `sync/src/gfd_sync/detector.py`; ниже приведены
+только опорные части.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from pathlib import PurePosixPath
 
 from .chunks import Chunk
 from .clients import pg_source
 from .config import EXCLUDED_CHAINS
+
+# СЕТЬ_ГГГГ_ММ.xlsx — как файлы называет система загрузки.
+_ИМЯ_ФАЙЛА = re.compile(r"^(?P<chain>.+)_(?P<year>\d{4})_(?P<month>\d{2})\.[^.]+$")
 
 
 def new_files(since: datetime | None = None) -> list[dict]:
@@ -2616,23 +2655,34 @@ def new_files(since: datetime | None = None) -> list[dict]:
 
 
 def chunks_from_files(files: list[dict]) -> list[Chunk]:
-    """Спрашиваем у sales, какие пары «месяц × сеть» пришли из этих файлов."""
+    """Спрашиваем у sales, какие пары «месяц × сеть» пришли из этих файлов.
+
+    Имена, разобранные по шаблону, идут одним запросом с сужением по сети
+    и месяцу (индексный поиск); остальные — вторым, без сужения.
+    Возвращают оба запроса одно и то же: год, месяц и сеть из самих данных.
+    """
     names = [PurePosixPath(f["file_path"]).name for f in files]
     if not names:
         return []
-    excluded = ", ".join(f"'{c}'" for c in EXCLUDED_CHAINS)
+
+    понятные = {имя: п for имя in names if (п := _подсказка(имя))}
+    прочие = [имя for имя in names if имя not in понятные]
+
+    куски: list[Chunk] = []
     with pg_source() as conn:
-        rows = conn.execute(f"""
-            SELECT DISTINCT
-                   extract(year FROM pdate)::int,
-                   extract(month FROM pdate)::int,
-                   upper(trim(client))
-            FROM public.sales
-            WHERE name_file = ANY(%s)
-              AND pdate IS NOT NULL
-              AND upper(trim(client)) NOT IN ({excluded})
-        """, (names,)).fetchall()
-    return [Chunk(y, m, c) for y, m, c in rows]
+        if понятные:
+            подсказки = list(понятные.values())
+            куски += _куски_запросом(
+                conn, list(понятные),
+                "AND upper(trim(client)) = ANY(%s) AND pdate >= %s AND pdate < %s",
+                ([п.chain for п in подсказки],
+                 min(п.date_from for п in подсказки),
+                 max(п.date_to for п in подсказки)),
+            )
+        if прочие:
+            # Имя ни о чём не говорит — придётся искать по всей таблице.
+            куски += _куски_запросом(conn, прочие, "", ())
+    return куски
 
 
 def pending_chunks() -> list[Chunk]:
@@ -2643,7 +2693,7 @@ def pending_chunks() -> list[Chunk]:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_detector.py -v`
-Expected: четыре теста PASS.
+Expected: семь тестов PASS.
 
 - [ ] **Step 5: Коммит**
 
