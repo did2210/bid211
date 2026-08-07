@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     pg_source_dsn: str
     pg_app_dsn: str
 
+    # Адрес PostgreSQL глазами контейнера ClickHouse: за словарями сервер
+    # ходит сам, и «localhost» из DSN указывал бы ему на самого себя.
+    # Локально это имена сервисов в docker-сети, на сервере — адрес машины.
+    dict_source_host: str = "pg_source"
+    dict_source_port: int = 5432
+    dict_app_host: str = "pg_app"
+    dict_app_port: int = 5432
+
     load_date_from: date = date(2026, 1, 1)
     load_date_to: date = date(2027, 1, 1)
 

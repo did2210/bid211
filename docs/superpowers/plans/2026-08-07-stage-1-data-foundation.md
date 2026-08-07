@@ -1312,7 +1312,8 @@ def test_литраж_числовой():
     create_dictionaries(ch)
     litrag = ch.command(
         "SELECT dictGetFloat64('dict_product', 'litrag', tuple('X000001'))")
-    assert litrag > 0
+    # command() отдаёт скалярный ответ текстом, поэтому приводим явно.
+    assert float(litrag) > 0
 
 
 def test_правка_в_источнике_видна_после_перезагрузки_словаря():
@@ -1339,6 +1340,19 @@ def test_адрес_по_составному_ключу():
         "SELECT dictGetString('dict_address', 'city', tuple(%(s)s, %(c)s))",
         parameters={"s": store_no, "c": client})
     assert city != ""
+
+
+def test_переименование_сети_подтягивается():
+    """Словарь создаётся лениво: SHOW DICTIONARIES покажет его и при
+    недоступном источнике или отсутствующей таблице client_map.
+    Значение спрашиваем явно — иначе правила переименования могли бы
+    молча не приехать, а сети остались бы под старыми именами.
+    """
+    ch = ch_client()
+    create_dictionaries(ch)
+    assert ch.command(
+        "SELECT dictGetString('dict_client_map', 'new_client', tuple('ЧИЖИК'))"
+    ) == "X5 ЧИЖИК"
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -1450,14 +1464,33 @@ ON CONFLICT (old_client) DO NOTHING;
 
 - [ ] **Step 5: Дописать `create_dictionaries` в `schema.py`**
 
+За словарями ходит **сам сервер ClickHouse**, из своего контейнера. Хост
+и порт поэтому берутся не из DSN (тот описывает путь от синхронизатора):
+`localhost` из DSN указал бы ClickHouse на самого себя. В `Settings`
+добавляются поля `dict_source_host`, `dict_source_port`, `dict_app_host`,
+`dict_app_port` — локально это имена сервисов docker-сети (`pg_source`,
+`pg_app`, порт 5432), на сервере — адрес машины с боевой базой. Те же
+переменные добавляются в `.env.example`.
+
 ```python
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+def _statements(sql: str) -> list[str]:
+    """Режет файл на операторы: ClickHouse принимает их только по одному.
+
+    Границей считается точка с запятой в конце строки, а не то, что идёт
+    следом: между операторами стоят комментарии, и они просто прилипают
+    к началу следующего — это допустимо.
+    """
+    return [s for s in re.split(r";\s*\n", sql) if s.strip()]
+
 
 def _dsn_parts(dsn: str) -> dict[str, str]:
     u = urlparse(dsn)
     return {"host": u.hostname or "localhost", "port": str(u.port or 5432),
-            "user": u.username or "", "password": u.password or "",
+            "user": unquote(u.username or ""),
+            "password": unquote(u.password or ""),
             "db": (u.path or "/").lstrip("/")}
 
 
@@ -1468,22 +1501,29 @@ def create_dictionaries(client: Client) -> None:
     src, app = _dsn_parts(s.pg_source_dsn), _dsn_parts(s.pg_app_dsn)
     sql = (SCHEMA_DIR / "02_dictionaries.sql").read_text(encoding="utf-8")
     sql = sql.format(
-        host=src["host"], port=src["port"], user=src["user"],
-        password=src["password"], db=src["db"],
-        app_host=app["host"], app_port=app["port"], app_user=app["user"],
-        app_password=app["password"], app_db=app["db"],
+        # Хост и порт берутся из настроек словарей, а не из DSN: DSN описывает
+        # путь от синхронизатора, а ходить по нему будет сервер ClickHouse.
+        host=s.dict_source_host, port=s.dict_source_port,
+        user=src["user"], password=src["password"], db=src["db"],
+        app_host=s.dict_app_host, app_port=s.dict_app_port,
+        app_user=app["user"], app_password=app["password"], app_db=app["db"],
     )
-    for statement in re.split(r";\s*\n(?=CREATE)", sql):
-        if statement.strip():
-            client.command(statement)
+    for statement in _statements(sql):
+        client.command(statement)
 ```
 
-Добавить в начало файла: `from .config import get_settings`.
+Добавить в начало файла: `from .config import get_settings`. Тем же
+`_statements` начинает пользоваться и `_run_sql_file`.
+
+**Служебную базу придётся пересоздать:** init-скрипты PostgreSQL выполняются
+только на пустом каталоге данных, а том `pg_app` к этому моменту уже создан.
+`docker compose rm -sf pg_app && docker volume rm gfd-bi_pg_app_data &&
+docker compose --profile dev up -d pg_app`.
 
 - [ ] **Step 6: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_dictionaries.py -v`
-Expected: шесть тестов PASS.
+Expected: семь тестов PASS.
 
 - [ ] **Step 7: Коммит**
 
