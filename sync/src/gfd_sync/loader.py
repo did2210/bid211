@@ -28,6 +28,18 @@ _INSERT_SETTINGS = {
     "max_memory_usage": 4 * 1024**3,
 }
 
+# Сколько CSV копим перед отправкой в ClickHouse.
+#
+# COPY отдаёт данные построчно, и отправлять их в том же темпе нельзя:
+# каждая вставка — отдельный HTTP-запрос и отдельный парт. На куске
+# в 125 тысяч строк это 54 тысячи запросов, десять минут вместо секунд
+# и столько же мелких партов, из-за которых ClickHouse начинает
+# придерживать вставки. Копим порциями и шлём разом.
+#
+# 16 МБ — это порядка 200 тысяч строк: и парт получается взрослый,
+# и память под буфер предсказуемая.
+_РАЗМЕР_ПОРЦИИ = 16 * 1024**2
+
 
 class LoadResult(NamedTuple):
     chunk: Chunk
@@ -79,12 +91,25 @@ def load_chunk(chunk: Chunk, target: str = "sales") -> LoadResult:
         ch.command(f"ALTER TABLE sales_staging DROP PARTITION {part}")
 
         rows = 0
+
+        def влить(порция: bytes) -> None:
+            ch.raw_insert("sales_staging", column_names=list(SALES_COLUMNS),
+                          insert_block=порция, fmt="CSV",
+                          settings=_INSERT_SETTINGS)
+
+        буфер: list[bytes] = []
+        накоплено = 0
         for block in read_chunk(chunk):
             if not block:
                 continue
-            ch.raw_insert("sales_staging", column_names=list(SALES_COLUMNS),
-                          insert_block=block, fmt="CSV", settings=_INSERT_SETTINGS)
+            буфер.append(block)
+            накоплено += len(block)
             rows += block.count(b"\n")
+            if накоплено >= _РАЗМЕР_ПОРЦИИ:
+                влить(b"".join(буфер))
+                буфер, накоплено = [], 0
+        if буфер:
+            влить(b"".join(буфер))
 
         src = source_stats(chunk)
         got = target_stats(chunk, table="sales_staging")

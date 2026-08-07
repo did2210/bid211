@@ -126,6 +126,10 @@ def full_reload(yes: bool) -> None:
     ch = ch_client()
     create_shadow(ch)
     ch.command("TRUNCATE TABLE sales_shadow")
+    # Прерванная заливка оставляет в промежуточной таблице партиции тех
+    # кусков, на которых её убили. Сами по себе они не мешают, но занимают
+    # место и копятся от сбоя к сбою — перед долгой операцией убираем.
+    ch.command("TRUNCATE TABLE sales_staging")
 
     s = get_settings()
     chunks = chunks_in_period(s.load_date_from, s.load_date_to,

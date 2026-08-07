@@ -59,6 +59,27 @@ def test_залитое_совпадает_с_источником_по_ключ
     assert (товаров, точек, сумма_id) == tuple(ожидаемое)
 
 
+def test_кусок_заливается_немногими_вставками():
+    """COPY отдаёт данные построчно, и наивная перекладка шлёт по запросу
+    на строку: 54 тысячи запросов на кусок, 388 секунд впустую и столько же
+    мелких партов, от которых ClickHouse начинает притормаживать вставки.
+    Считаем запросы, а не секунды: время зависит от машины, а это — нет.
+    """
+    ch = ch_client()
+    chunk = Chunk(2026, 7, "ДИКСИ")
+    ch.command("SYSTEM FLUSH LOGS")
+    запрос = ("SELECT count() FROM system.query_log WHERE type = 'QueryFinish' "
+              "AND query_kind = 'Insert' AND event_time > now() - INTERVAL 1 HOUR")
+    было = int(ch.command(запрос))
+
+    result = load_chunk(chunk)
+    assert result.replaced, "кусок должен залиться"
+
+    ch.command("SYSTEM FLUSH LOGS")
+    вставок = int(ch.command(запрос)) - было
+    assert вставок <= 10, f"на один кусок ушло {вставок} вставок"
+
+
 def test_повторная_заливка_не_задваивает():
     """Подмена партиции, а не досыпка: два прогона дают тот же результат."""
     chunk = Chunk(2026, 7, "ЛЕНТА")
@@ -126,8 +147,12 @@ def test_расхождение_отменяет_подмену(monkeypatch):
 
 
 def test_промежуточная_таблица_очищается():
+    ch = ch_client()
+    # Чистим до, а не только проверяем после: прерванная заливка оставляет
+    # в промежуточной таблице партиции чужих кусков, и они копятся.
+    ch.command("TRUNCATE TABLE sales_staging")
     load_chunk(Chunk(2026, 7, "АШАН"))
-    assert ch_client().command("SELECT count() FROM sales_staging") == 0
+    assert ch.command("SELECT count() FROM sales_staging") == 0
 
 
 def test_заливка_в_теневую_не_видна_в_основной(без_теневой):
