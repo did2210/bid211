@@ -776,8 +776,10 @@ git commit -m "Генератор синтетических данных по �
 """Настройки читаются из окружения, соединение с источником — только на чтение."""
 import psycopg
 import pytest
+
+from gfd_sync.clients import ch_client, pg_app, pg_source
 from gfd_sync.config import get_settings
-from gfd_sync.clients import ch_client, pg_source, pg_app
+from tools.gen_fake_data import CHAINS
 
 
 def test_настройки_читаются():
@@ -790,6 +792,17 @@ def test_исключённые_сети_заданы():
     s = get_settings()
     assert set(s.excluded_chains) == {
         "ДОМ ЛЕНТА", "КАРУСЕЛЬ", "ЛЕНТА ЗООМАРКЕТ", "ПЯТЁРОЧКА РЦ"}
+
+
+def test_исключённые_сети_есть_в_источнике():
+    """Написание должно совпадать посимвольно с тем, что лежит в данных.
+
+    Фильтр сравнивает названия как текст, поэтому «ПЯТЁРОЧКА РЦ» через «Е»
+    вместо «Ё» не отсеет ничего и сделает это молча: заливка пройдёт,
+    а в витрину приедут лишние сети.
+    """
+    сети_источника = {название for название, _ in CHAINS}
+    assert set(get_settings().excluded_chains) <= сети_источника
 
 
 def test_клиент_clickhouse_работает():
@@ -820,6 +833,7 @@ Expected: FAIL — `ModuleNotFoundError: gfd_sync.config`
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -827,9 +841,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # при заливке, а не в слое метрик.
 EXCLUDED_CHAINS = ("ДОМ ЛЕНТА", "КАРУСЕЛЬ", "ЛЕНТА ЗООМАРКЕТ", "ПЯТЁРОЧКА РЦ")
 
+# Путь считается от расположения модуля, а не от текущего каталога: команды
+# синхронизатора запускаются и из cron, и из любого места на сервере,
+# а «../.env» нашёлся бы только при запуске из каталога sync.
+ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
     ch_host: str = "localhost"
     ch_port: int = 8123
@@ -889,7 +908,7 @@ def pg_app() -> psycopg.Connection:
 - [ ] **Step 5: Прогнать тесты**
 
 Run: `cd sync && pytest tests/test_config.py -v`
-Expected: пять тестов PASS.
+Expected: шесть тестов PASS.
 
 - [ ] **Step 6: Коммит**
 
