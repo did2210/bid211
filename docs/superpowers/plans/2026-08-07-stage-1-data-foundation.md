@@ -58,6 +58,7 @@ gfd-bi/
 
 **Files:**
 - Create: `docker-compose.yml`, `.env.example`, `clickhouse/config.d/limits.xml`
+- Create: `clickhouse/users.d/limits.xml`
 - Create: `sync/pyproject.toml`, `sync/src/gfd_sync/__init__.py`
 - Test: `sync/tests/test_smoke.py`
 
@@ -69,30 +70,88 @@ gfd-bi/
 
 `sync/tests/test_smoke.py`:
 
+Проверяем не только «сервисы отвечают», но и что каждая настройка из наших
+конфигов действительно доехала до сервера: и config.d, и users.d молча
+игнорируют то, что положено не туда.
+
 ```python
 """Проверка, что инфраструктура поднята и отвечает."""
 import os
+
 import clickhouse_connect
 import psycopg
+import pytest
+
+# Потолок памяти сервера из clickhouse/config.d/limits.xml.
+ПОТОЛОК_ПАМЯТИ = 40 * 1024**3
+
+
+def ch_клиент():
+    return clickhouse_connect.get_client(
+        host=os.environ["CH_HOST"], port=int(os.environ["CH_PORT"]),
+        username=os.environ["CH_USER"], password=os.environ["CH_PASSWORD"],
+    )
 
 
 def test_clickhouse_отвечает():
-    client = clickhouse_connect.get_client(
-        host=os.environ["CH_HOST"], port=int(os.environ["CH_PORT"]),
-        username=os.environ["CH_USER"], password=os.environ["CH_PASSWORD"],
-    )
-    assert client.command("SELECT 1") == 1
+    assert ch_клиент().command("SELECT 1") == 1
 
 
-def test_clickhouse_лимиты_применены():
-    client = clickhouse_connect.get_client(
-        host=os.environ["CH_HOST"], port=int(os.environ["CH_PORT"]),
-        username=os.environ["CH_USER"], password=os.environ["CH_PASSWORD"],
-    )
-    limit = client.command(
+def test_clickhouse_потолок_памяти():
+    """Потолок памяти сервера — 40 ГБ, но не больше, чем позволяет машина.
+
+    ClickHouse сам опускает его до 90 % доступной оперативной памяти, если
+    машина меньше боевой. На сервере (62 ГБ) сработает наши 40 ГБ,
+    на машине разработчика — урезанное значение.
+    """
+    client = ch_клиент()
+    предел = int(client.command(
         "SELECT value FROM system.server_settings WHERE name = 'max_server_memory_usage'"
+    ))
+    всего_памяти = int(client.command(
+        "SELECT value FROM system.asynchronous_metrics WHERE metric = 'OSMemoryTotal'"
+    ))
+    ожидаемый = min(ПОТОЛОК_ПАМЯТИ, int(всего_памяти * 0.9))
+    assert предел == pytest.approx(ожидаемый, rel=0.05)
+
+
+@pytest.mark.parametrize("настройка, ожидание", [
+    ("background_pool_size", "8"),
+    ("background_merges_mutations_concurrency_ratio", "2"),
+])
+def test_clickhouse_фоновый_пул_урезан(настройка, ожидание):
+    """Фоновые слияния делят диск с PostgreSQL, поэтому пул урезан вдвое."""
+    значение = ch_клиент().command(
+        f"SELECT value FROM system.server_settings WHERE name = '{настройка}'"
     )
-    assert int(limit) == 40 * 1024**3, "лимит памяти сервера должен быть 40 ГБ"
+    # command() приводит числовые строки к int, поэтому сравниваем как текст.
+    assert str(значение) == ожидание
+
+
+@pytest.mark.parametrize("настройка, ожидание", [
+    ("number_of_free_entries_in_pool_to_execute_mutation", "10"),
+    ("number_of_free_entries_in_pool_to_lower_max_size_of_merge", "4"),
+    ("number_of_free_entries_in_pool_to_execute_optimize_entire_partition", "12"),
+])
+def test_clickhouse_пороги_merge_tree_согласованы_с_пулом(настройка, ожидание):
+    """Пороги считаются от размера пула: с дефолтами сервер не стартует вовсе."""
+    значение = ch_клиент().command(
+        f"SELECT value FROM system.merge_tree_settings WHERE name = '{настройка}'"
+    )
+    assert str(значение) == ожидание
+
+
+@pytest.mark.parametrize("настройка, ожидание", [
+    ("max_memory_usage", str(10 * 1024**3)),
+    ("max_threads", "8"),
+    ("max_execution_time", "60"),
+])
+def test_clickhouse_ограничения_профиля_применены(настройка, ожидание):
+    """Ограничения на отдельный запрос: профили задаются в users.d, не в config.d."""
+    значение = ch_клиент().command(
+        f"SELECT value FROM system.settings WHERE name = '{настройка}'"
+    )
+    assert str(значение) == ожидание
 
 
 def test_служебный_postgres_отвечает():
@@ -116,7 +175,11 @@ services:
       - "${CH_PORT:-8123}:8123"
       - "9000:9000"
     volumes:
-      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      # Именно файлом, а не каталогом: монтирование каталога затирает штатный
+      # docker_related_config.xml образа, который открывает прослушивание
+      # наружу. Без него сервер слышен только внутри контейнера.
+      - ./clickhouse/config.d/limits.xml:/etc/clickhouse-server/config.d/limits.xml:ro
+      - ./clickhouse/users.d/limits.xml:/etc/clickhouse-server/users.d/limits.xml:ro
       - ch_data:/var/lib/clickhouse
     environment:
       CLICKHOUSE_USER: ${CH_USER}
@@ -125,7 +188,10 @@ services:
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      # Стучимся по сетевому имени, а не в localhost: сервер, слушающий
+      # только loopback, отвечает на localhost и выглядит здоровым,
+      # оставаясь недоступным и с хоста, и из соседних контейнеров.
+      test: ["CMD", "wget", "--spider", "-q", "http://clickhouse:8123/ping"]
       interval: 5s
       retries: 12
 
@@ -184,10 +250,38 @@ volumes:
     <background_pool_size>8</background_pool_size>
     <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
 
+    <!-- Пороги свободных слотов пула считаются от дефолтного пула в 32 задачи
+         (16 × 2). Мы урезали пул вдвое, до 16, — с дефолтами (20, 8, 25)
+         сервер не стартует вовсе: проверка на старте считает такую
+         конфигурацию неработоспособной. Значения уменьшены в той же
+         пропорции. -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>10</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>12</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+
+    <!-- Ограничения на отдельный запрос — в clickhouse/users.d/limits.xml:
+         секция <profiles> действует только там. -->
+</clickhouse>
+```
+
+- [ ] **Step 4б: Написать `clickhouse/users.d/limits.xml`**
+
+Профили читаются только из `users.xml` и `users.d`. Та же секция, положенная
+в `config.d`, применяется молча-никак: сервер стартует, а ограничения остаются
+дефолтными.
+
+```xml
+<clickhouse>
     <profiles>
         <default>
+            <!-- Один запрос не должен выедать весь потолок сервера: место
+                 нужно остальным двадцати пяти пользователям. -->
             <max_memory_usage>10737418240</max_memory_usage>
             <max_threads>8</max_threads>
+            <!-- Отчёт, считающийся дольше минуты, — ошибка в запросе,
+                 а не терпеливый пользователь. -->
             <max_execution_time>60</max_execution_time>
         </default>
     </profiles>
@@ -289,7 +383,7 @@ uv run pytest tests/test_smoke.py -v
 Дальше во всех задачах вместо `pytest ...` запускать `uv run pytest ...`
 из каталога `sync`.
 
-Expected: три теста PASS.
+Expected: 11 тестов PASS.
 
 - [ ] **Step 9: Коммит**
 

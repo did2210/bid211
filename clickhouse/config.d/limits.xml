@@ -9,11 +9,17 @@
     <background_pool_size>8</background_pool_size>
     <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
 
-    <profiles>
-        <default>
-            <max_memory_usage>10737418240</max_memory_usage>
-            <max_threads>8</max_threads>
-            <max_execution_time>60</max_execution_time>
-        </default>
-    </profiles>
+    <!-- Пороги свободных слотов пула считаются от дефолтного пула в 32 задачи
+         (16 × 2). Мы урезали пул вдвое, до 16, — с дефолтами (20, 8, 25)
+         сервер не стартует вовсе: проверка на старте считает такую
+         конфигурацию неработоспособной. Значения уменьшены в той же
+         пропорции. -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>10</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>12</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+
+    <!-- Ограничения на отдельный запрос — в clickhouse/users.d/limits.xml:
+         секция <profiles> действует только там. -->
 </clickhouse>
