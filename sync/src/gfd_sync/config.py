@@ -1,0 +1,61 @@
+"""Настройки синхронизатора. Всё берётся из окружения, ничего не зашито."""
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Сети, которые не попадают в витрину. Правило стабильное, поэтому применяется
+# при заливке, а не в слое метрик.
+EXCLUDED_CHAINS = ("ДОМ ЛЕНТА", "КАРУСЕЛЬ", "ЛЕНТА ЗООМАРКЕТ", "ПЯТЁРОЧКА РЦ")
+
+# Путь считается от расположения модуля, а не от текущего каталога: команды
+# синхронизатора запускаются и из cron, и из любого места на сервере,
+# а «../.env» нашёлся бы только при запуске из каталога sync.
+ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+
+    ch_host: str = "localhost"
+    ch_port: int = 8123
+    ch_user: str = "gfd"
+    ch_password: str = ""
+    ch_db: str = "default"
+
+    pg_source_dsn: str
+    pg_app_dsn: str
+
+    # Адрес PostgreSQL глазами контейнера ClickHouse: за словарями сервер
+    # ходит сам, и «localhost» из DSN указывал бы ему на самого себя.
+    # Локально это имена сервисов в docker-сети, на сервере — адрес машины.
+    dict_source_host: str = "pg_source"
+    dict_source_port: int = 5432
+    dict_app_host: str = "pg_app"
+    dict_app_port: int = 5432
+
+    load_date_from: date = date(2026, 1, 1)
+    load_date_to: date = date(2027, 1, 1)
+
+    # Белый список сетей: пусто — работаем со всеми, кроме исключённых.
+    # Задаётся через запятую и нужен, чтобы гонять первые прогоны на боевой
+    # базе по паре сетей, а не по всему миллиарду строк.
+    only_chains: str = ""
+
+    @property
+    def excluded_chains(self) -> tuple[str, ...]:
+        return EXCLUDED_CHAINS
+
+    @property
+    def only_chains_list(self) -> tuple[str, ...]:
+        return tuple(
+            сеть.strip().upper()
+            for сеть in self.only_chains.split(",")
+            if сеть.strip()
+        )
+
+
+def get_settings() -> Settings:
+    return Settings()

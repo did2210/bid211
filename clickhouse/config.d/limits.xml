@@ -1,0 +1,25 @@
+<clickhouse>
+    <!-- Потолок памяти всего сервера. Не резервирование: пока запросов нет,
+         память остаётся боевому PostgreSQL под кеш страниц.
+         22 ГБ запаса от 62 ГБ машины — страховка от того, что системный
+         OOM killer выберет жертвой PostgreSQL. -->
+    <max_server_memory_usage>42949672960</max_server_memory_usage>
+
+    <!-- Фоновые слияния лезут на тот же диск, где работает PostgreSQL. -->
+    <background_pool_size>8</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+
+    <!-- Пороги свободных слотов пула считаются от дефолтного пула в 32 задачи
+         (16 × 2). Мы урезали пул вдвое, до 16, — с дефолтами (20, 8, 25)
+         сервер не стартует вовсе: проверка на старте считает такую
+         конфигурацию неработоспособной. Значения уменьшены в той же
+         пропорции. -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>10</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>12</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+
+    <!-- Ограничения на отдельный запрос — в clickhouse/users.d/limits.xml:
+         секция <profiles> действует только там. -->
+</clickhouse>
