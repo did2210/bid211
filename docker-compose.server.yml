@@ -1,0 +1,40 @@
+# Отличия боевого сервера от машины разработчика.
+#
+# Применяется поверх основного файла:
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+#
+# Что здесь меняется и почему:
+#   * порты слушают только localhost — витрина и служебная база не нужны
+#     всей внутренней сети, наружу их выставит nginx на третьем этапе;
+#   * контейнеры поднимаются сами после перезагрузки сервера;
+#   * данные лежат на /mnt/gfd_data: корневой раздел всего 124 ГБ,
+#     и витрина забила бы его вместе с боевой базой.
+#
+# Контейнер имитации источника (pg_source) сюда не входит вовсе:
+# на сервере источник — настоящая боевая база.
+
+services:
+  clickhouse:
+    ports:
+      - "127.0.0.1:${CH_PORT:-8123}:8123"
+      - "127.0.0.1:9000:9000"
+    restart: unless-stopped
+
+  pg_app:
+    ports:
+      - "127.0.0.1:${PG_APP_PORT:-5433}:5432"
+    restart: unless-stopped
+
+volumes:
+  ch_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gfd_data/gfd-bi/clickhouse
+  pg_app_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gfd_data/gfd-bi/pg_app
