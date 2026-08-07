@@ -30,6 +30,12 @@ def known_chains(date_from: date | None = None,
     вычитывает таблицу продаж целиком, а с ним планировщик уходит
     в индекс (upper(trim(client)), pdate) и читает только нужный кусок.
     """
+    s = get_settings()
+    # Белый список задан — незачем спрашивать источник вовсе: список сетей
+    # уже известен, а DISTINCT по таблице продаж стоит дорого.
+    if s.only_chains_list:
+        return sorted(set(s.only_chains_list) - set(EXCLUDED_CHAINS))
+
     excluded = ", ".join(f"'{c}'" for c in EXCLUDED_CHAINS)
     период = ""
     параметры: tuple = ()

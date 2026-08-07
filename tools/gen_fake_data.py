@@ -5,13 +5,22 @@
 """
 from __future__ import annotations
 
+import os
 import random
 from datetime import date
 
 import psycopg
 
-SCHEMA = """
+MARKER = "synthetic_data_marker"
+
+SCHEMA = f"""
 DROP TABLE IF EXISTS sales, address, kib_monthly_data, load_log, product CASCADE;
+
+-- Метка синтетики. По ней генератор отличает свою базу от чужой и
+-- отказывается сносить данные, которых не создавал.
+CREATE TABLE IF NOT EXISTS {MARKER} (
+    created_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE product (
     id bigserial PRIMARY KEY,
@@ -95,6 +104,28 @@ FORMATS = ["ГИПЕРМАРКЕТ", "СУПЕРМАРКЕТ", "У ДОМА", "�
 SEASON = [.82, .80, .94, 1.00, 1.12, 1.24, 1.31, 1.28, 1.05, .92, .85, .97]
 
 
+def _убедиться_что_база_синтетическая(conn) -> None:
+    """Отказывается работать с базой, которую генератор не создавал.
+
+    Первое, что делает генератор, — сносит sales, product и address. Дай
+    ему боевой DSN (а он лежит в той же переменной окружения, что и для
+    синхронизатора) — и данных не станет. Своя база помечена таблицей
+    synthetic_data_marker; нет метки, но есть продажи — значит база чужая.
+    """
+    есть_продажи = conn.execute(
+        "SELECT to_regclass('public.sales') IS NOT NULL").fetchone()[0]
+    есть_метка = conn.execute(
+        f"SELECT to_regclass('public.{MARKER}') IS NOT NULL").fetchone()[0]
+    if есть_продажи and not есть_метка:
+        if os.environ.get("GFD_FAKE_DATA_FORCE") == "1":
+            return          # осознанное разрешение: база тестовая, метки ещё нет
+        raise RuntimeError(
+            "в базе есть таблица sales, но нет метки синтетики "
+            f"({MARKER}). Похоже на боевую базу — пересоздавать отказываюсь. "
+            "Если база точно тестовая, повторите с GFD_FAKE_DATA_FORCE=1."
+        )
+
+
 def generate(dsn: str, rows: int, year: int = 2026, seed: int = 42) -> dict[str, int]:
     """Пересоздаёт схему и наполняет её. Один seed — одни и те же данные."""
     rnd = random.Random(seed)
@@ -132,6 +163,7 @@ def generate(dsn: str, rows: int, year: int = 2026, seed: int = 42) -> dict[str,
         by_chain.setdefault(chain, []).append(store_no)
 
     with psycopg.connect(dsn, autocommit=True) as conn:
+        _убедиться_что_база_синтетическая(conn)
         conn.execute(SCHEMA)
 
         with conn.cursor().copy(
@@ -157,11 +189,13 @@ def generate(dsn: str, rows: int, year: int = 2026, seed: int = 42) -> dict[str,
                 store_no = rnd.choice(by_chain[chain])
                 prod = rnd.choice(products)
                 month = rnd.randrange(1, 13)
-                day = rnd.randrange(1, 29)
                 items = round(rnd.uniform(1, 40) * SEASON[month - 1], 2)
                 price = round(rnd.uniform(45, 190), 2)
                 cp.write_row((
-                    store_no, prod[0], date(year, month, day),
+                    # В боевой базе продажи агрегированы по месяцам: дата —
+                    # всегда первое число. Синтетика обязана быть такой же,
+                    # иначе замеры сжатия и сортировки врут в нашу пользу.
+                    store_no, prod[0], date(year, month, 1),
                     items, round(items * price, 2), chain,
                     f"{chain}_{year}_{month:02d}.xlsx",
                     "1" if rnd.random() < 0.04 else None,

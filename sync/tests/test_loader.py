@@ -173,11 +173,16 @@ def test_заливка_в_теневую_не_видна_в_основной(б
 
 def test_обмен_таблиц_переключает_данные_разом(без_теневой):
     ch = ch_client()
+    было_в_витрине = ch.command("SELECT count() FROM sales")
     create_shadow(ch)
     ch.command("TRUNCATE TABLE sales_shadow")
     load_chunk(Chunk(2026, 7, "ОКЕЙ"), target="sales_shadow")
     в_теневой = ch.command("SELECT count() FROM sales_shadow")
 
     swap_shadow(ch)
-
     assert ch.command("SELECT count() FROM sales") == в_теневой
+
+    # Возвращаем витрину на место. Тест, оставляющий её усечённой, — это
+    # уже не тест: один прогон на сервере стёр бы боевые данные.
+    swap_shadow(ch)
+    assert ch.command("SELECT count() FROM sales") == было_в_витрине

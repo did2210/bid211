@@ -4,7 +4,7 @@ import os
 import psycopg
 import pytest
 
-from tools.gen_fake_data import generate
+from tools.gen_fake_data import MARKER, generate
 
 СТРОК = 50_000
 ГОД = 2026
@@ -15,6 +15,28 @@ def сгенерированная_база():
     dsn = os.environ["PG_SOURCE_DSN"]
     counts = generate(dsn, rows=СТРОК, year=ГОД, seed=42)
     return dsn, counts
+
+
+def test_чужую_базу_генератор_не_трогает(сгенерированная_база, monkeypatch):
+    """Генератор начинает с DROP TABLE sales. Боевой DSN лежит в той же
+    переменной окружения, что и для синхронизатора, — перепутать проще
+    простого, а цена ошибки — снесённая боевая база. Своя база помечена;
+    нет метки, но есть продажи — работать отказываемся.
+    """
+    # Обход предохранителя существует для первичной настройки пустой базы;
+    # здесь проверяется сам предохранитель, поэтому обход снимаем.
+    monkeypatch.delenv("GFD_FAKE_DATA_FORCE", raising=False)
+    dsn, _ = сгенерированная_база
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE {MARKER}")
+        try:
+            with pytest.raises(RuntimeError, match="отказываюсь"):
+                generate(dsn, rows=100)
+            # и данные на месте, ничего не снесено
+            assert conn.execute("SELECT count(*) FROM sales").fetchone()[0] > 0
+        finally:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {MARKER} "
+                         "(created_at timestamptz NOT NULL DEFAULT now())")
 
 
 def test_создаёт_все_таблицы(сгенерированная_база):

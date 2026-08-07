@@ -39,9 +39,22 @@ class Settings(BaseSettings):
     load_date_from: date = date(2026, 1, 1)
     load_date_to: date = date(2027, 1, 1)
 
+    # Белый список сетей: пусто — работаем со всеми, кроме исключённых.
+    # Задаётся через запятую и нужен, чтобы гонять первые прогоны на боевой
+    # базе по паре сетей, а не по всему миллиарду строк.
+    only_chains: str = ""
+
     @property
     def excluded_chains(self) -> tuple[str, ...]:
         return EXCLUDED_CHAINS
+
+    @property
+    def only_chains_list(self) -> tuple[str, ...]:
+        return tuple(
+            сеть.strip().upper()
+            for сеть in self.only_chains.split(",")
+            if сеть.strip()
+        )
 
 
 def get_settings() -> Settings:

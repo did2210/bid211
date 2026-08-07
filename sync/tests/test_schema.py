@@ -5,9 +5,11 @@ from gfd_sync.schema import SALES_COLUMNS, create_sales_tables
 
 
 def колонки(ch, таблица):
+    # Фильтр по базе обязателен: одноимённые таблицы есть и в витрине,
+    # и в тестовой базе, а без него в выборку попадут обе.
     return [(r[0], r[1]) for r in ch.query(
         f"SELECT name, type FROM system.columns WHERE table = '{таблица}' "
-        "ORDER BY position").result_rows]
+        "AND database = currentDatabase() ORDER BY position").result_rows]
 
 
 def test_таблицы_создаются():
@@ -21,7 +23,7 @@ def test_ключ_партиционирования_месяц_и_сеть():
     ch = ch_client()
     create_sales_tables(ch)
     key = ch.command(
-        "SELECT partition_key FROM system.tables WHERE name = 'sales'")
+        "SELECT partition_key FROM system.tables WHERE name = 'sales' AND database = currentDatabase()")
     assert "toYYYYMM(pdate)" in key
     assert "client" in key
 
@@ -30,7 +32,7 @@ def test_сортировка_по_коду_товара():
     ch = ch_client()
     create_sales_tables(ch)
     key = ch.command(
-        "SELECT sorting_key FROM system.tables WHERE name = 'sales'")
+        "SELECT sorting_key FROM system.tables WHERE name = 'sales' AND database = currentDatabase()")
     assert key.startswith("xcode")
 
 
