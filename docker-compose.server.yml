@@ -37,16 +37,20 @@ services:
       - "127.0.0.1:${PG_APP_PORT:-5433}:5432"
     restart: unless-stopped
 
+# Данные лежат отдельно от кода. Каталог репозитория тоже называется
+# gfd-bi и содержит папки clickhouse/ и pg_app/ с конфигами и init-скриптом:
+# направь тома туда — и PostgreSQL откажется инициализироваться поверх
+# непустого каталога, а ClickHouse свалит свои файлы вперемешку с исходниками.
 volumes:
   ch_data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /mnt/gfd_data/gfd-bi/clickhouse
+      device: /mnt/gfd_data/gfd-bi-data/clickhouse
   pg_app_data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /mnt/gfd_data/gfd-bi/pg_app
+      device: /mnt/gfd_data/gfd-bi-data/pg_app
