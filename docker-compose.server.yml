@@ -23,13 +23,17 @@ networks:
 
 services:
   clickhouse:
-    ports:
+    # !override обязателен: без него Compose складывает списки портов из
+    # обоих файлов, и получается два маппинга на один порт — сначала
+    # 0.0.0.0 из базового, следом 127.0.0.1 отсюда. Второй падает
+    # с «address already in use», причём порт при этом свободен.
+    ports: !override
       - "127.0.0.1:${CH_PORT:-8123}:8123"
       - "127.0.0.1:9000:9000"
     restart: unless-stopped
 
   pg_app:
-    ports:
+    ports: !override
       - "127.0.0.1:${PG_APP_PORT:-5433}:5432"
     restart: unless-stopped
 
